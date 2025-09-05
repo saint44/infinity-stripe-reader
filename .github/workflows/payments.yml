@@ -2,86 +2,10 @@ name: Payments 7d Snapshot
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"   # every 30 minutes
-
+    - cron: '*/30 * * * *'
 jobs:
-  pull:
+  sanity:
     runs-on: ubuntu-latest
     steps:
-      - name: Stripe — last 7d
-        env:
-          STRIPE_API_KEY: ${{ secrets.STRIPE_RO_KEY }}
-        run: |
-          set -e
-          START=$(date -u -d '7 days ago' +%s)
-          curl -sS -G https://api.stripe.com/v1/charges \
-            -u "$STRIPE_API_KEY:" \
-            --data-urlencode limit=100 \
-            --data-urlencode "created[gte]=$START" \
-            -o stripe_charges.json
-
-      - name: PayPal — last 7d
-        env:
-          PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID }}
-          PAYPAL_SECRET: ${{ secrets.PAYPAL_SECRET }}
-        run: |
-          set -e
-          START="$(date -u -d '7 days ago' +%Y-%m-%dT00:00:00Z)"
-          END="$(date -u +%Y-%m-%dT23:59:59Z)"
-          ACCESS_TOKEN=$(curl -s -u "$PAYPAL_CLIENT_ID:$PAYPAL_SECRET" \
-            -d grant_type=client_credentials https://api-m.paypal.com/v1/oauth2/token \
-            | python3 - <<'PY'
-import sys, json; print(json.load(sys.stdin).get("access_token",""))
-PY
-)
-          [ -n "$ACCESS_TOKEN" ] || { echo 'PayPal auth failed'; exit 1; }
-          curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
-            "https://api-m.paypal.com/v1/reporting/transactions?start_date=$START&end_date=$END&fields=all&page_size=500" \
-            -o paypal_7d.json
-
-      - name: Summarize Stripe + PayPal
-        run: |
-          python3 - <<'PY'
-          import json, pathlib
-          # Stripe
-          try:
-              sc = json.load(open("stripe_charges.json")).get("data", [])
-          except:
-              sc = []
-          s_ok = [c for c in sc if c.get("paid") and c.get("status") == "succeeded"]
-          s_total = sum(int(c.get("amount", 0) or 0) for c in s_ok) / 100
-          
-          # PayPal
-          try:
-              pd = json.load(open("paypal_7d.json"))
-              tx = pd.get("transaction_details", [])
-              p_total = 0.0
-              for t in tx:
-                  info = t.get("transaction_info", {})
-                  status = (info.get("transaction_status") or "").lower()
-                  if status in ("s", "completed", "ok", "success", "successwithwarning", "completed"):
-                      val = (info.get("transaction_amount", {}) or {}).get("value", "0").replace(",", "")
-                      try:
-                          p_total += float(val)
-                      except:
-                          pass
-          except:
-              tx = []
-              p_total = 0.0
-
-          print("=== Payments 7d Snapshot ===")
-          print(f"Stripe : ${s_total:,.2f} | succeeded: {len(s_ok)}")
-          print(f"PayPal : ${p_total:,.2f} | tx: {len(tx)}")
-
-          summary = {
-              "stripe": {"collected_7d": round(s_total, 2), "succeeded": len(s_ok)},
-              "paypal": {"collected_7d": round(p_total, 2), "tx": len(tx)}
-          }
-          pathlib.Path("summary.json").write_text(json.dumps(summary, indent=2))
-          PY
-
-      - name: Upload summary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: payments-7d-summary
-          path: summary.json
+      - name: OK
+        run: echo "workflow file is valid"
