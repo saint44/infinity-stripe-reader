@@ -1,7 +1,103 @@
-name: ok
-on: { workflow_dispatch: {} }
+name: Payments 7d Snapshot
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'
+
+permissions:
+  contents: write  # needed to push to gh-pages
+
 jobs:
-  j:
+  pull:
     runs-on: ubuntu-latest
     steps:
-      - run: echo OK
+      - name: Stripe — last 7d
+        env:
+          STRIPE_API_KEY: ${{ secrets.STRIPE_RO_KEY }}
+        run: |
+          set -e
+          START=$(date -u -d '7 days ago' +%s)
+          curl -sS -G https://api.stripe.com/v1/charges \
+            -u "$STRIPE_API_KEY:" \
+            --data-urlencode limit=100 \
+            --data-urlencode "created[gte]=$START" \
+            -o stripe_charges.json
+          python3 - <<'PY'
+import json,sys,pathlib
+try: d=json.load(open("stripe_charges.json")).get("data",[])
+except: d=[]
+s=[c for c in d if c.get("paid") and c.get("status")=="succeeded"]
+total=round(sum(int(x.get("amount",0) or 0) for x in s)/100,2)
+pathlib.Path("stripe_summary.json").write_text(json.dumps({"collected_7d": total, "succeeded": len(s)}))
+print("Stripe 7d:", f"${total:,.2f}", "count:", len(s))
+PY
+
+      - name: PayPal — last 7d (optional)
+        env:
+          PAYPAL_CLIENT_ID: ${{ secrets.PAYPAL_CLIENT_ID }}
+          PAYPAL_SECRET: ${{ secrets.PAYPAL_SECRET }}
+        run: |
+          set -e
+          if [ -z "${PAYPAL_CLIENT_ID}" ] || [ -z "${PAYPAL_SECRET}" ]; then
+            echo '{}' > paypal_7d.json
+          else
+            START="$(date -u -d '7 days ago' +%Y-%m-%dT00:00:00Z)"
+            END="$(date -u +%Y-%m-%dT23:59:59Z)"
+            ACCESS_TOKEN=$(curl -s -u "$PAYPAL_CLIENT_ID:$PAYPAL_SECRET" \
+              -d grant_type=client_credentials https://api-m.paypal.com/v1/oauth2/token \
+              | python3 - <<'PY'
+import sys,json; print(json.load(sys.stdin).get("access_token",""))
+PY
+)
+            if [ -z "$ACCESS_TOKEN" ]; then
+              echo '{}' > paypal_7d.json
+            else
+              curl -s -H "Authorization: Bearer $ACCESS_TOKEN" \
+                "https://api-m.paypal.com/v1/reporting/transactions?start_date=$START&end_date=$END&fields=all&page_size=500" \
+                -o paypal_7d.json
+            fi
+          fi
+          python3 - <<'PY'
+import json,sys,pathlib
+try:
+  doc=json.load(open("paypal_7d.json")); tx=doc.get("transaction_details",[]) or []
+except: tx=[]
+total=0.0
+for t in tx:
+  info=t.get("transaction_info",{}) or {}
+  status=(info.get("transaction_status") or "").lower()
+  if status in ("s","completed","ok","success","successwithwarning","completed"):
+    val=(info.get("transaction_amount",{}) or {}).get("value","0").replace(",","")
+    try: total+=float(val)
+    except: pass
+pathlib.Path("paypal_summary.json").write_text(json.dumps({"collected_7d": round(total,2), "tx": len(tx)}))
+print("PayPal 7d:", f"${total:,.2f}", "tx:", len(tx))
+PY
+
+      - name: Build summary + dashboard
+        run: |
+          python3 - <<'PY'
+import json, pathlib
+p=pathlib.Path(".")
+try: stripe=json.load(open("stripe_summary.json"))
+except: stripe={"collected_7d":0.0,"succeeded":0}
+try: paypal=json.load(open("paypal_summary.json"))
+except: paypal={"collected_7d":0.0,"tx":0}
+summary={"stripe":stripe,"paypal":paypal}
+p.joinpath("summary.json").write_text(json.dumps(summary, indent=2))
+html=f"""<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Infinity Nexus — Live</title>
+<style>body{{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:2rem}}.card{{border:1px solid #ddd;border-radius:10px;padding:1rem;max-width:640px}}</style>
+</head><body><h1>Infinity Nexus — Live Payments (7d)</h1>
+<div class='card'><pre id='out'>Loading…</pre></div>
+<script>fetch('summary.json',{cache:'no-store'}).then(r=>r.json()).then(j=>{document.getElementById('out').textContent=JSON.stringify(j,null,2)}).catch(e=>{document.getElementById('out').textContent=e})</script>
+</body></html>"""
+p.joinpath("index.html").write_text(html)
+cat summary.json
+PY
+
+      - name: Publish to GitHub Pages (gh-pages)
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: .
+          publish_branch: gh-pages
